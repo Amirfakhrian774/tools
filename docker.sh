@@ -241,17 +241,32 @@ list_volumes() {
     wait_for_enter
 }
 
-# --- Docker Compose Functions (Operate in Current Directory) ---
+# --- Docker Compose Functions (Operate in Specified Directory) ---
+
+get_compose_directory() {
+    local default_dir="$(pwd)"
+    local compose_dir
+    read -p "Enter the directory containing the docker-compose.yml/yaml file (default: $default_dir): " compose_dir
+    if [[ -z "$compose_dir" ]]; then
+        echo "$default_dir"
+    else
+        echo "$compose_dir"
+    fi
+}
 
 compose_up() {
-    print_step "Docker Compose Up (in $(pwd))"
+    print_step "Docker Compose Up"
     if [[ -z "$DOCKER_COMPOSE_CMD" ]]; then print_error "docker-compose / docker compose not found."; wait_for_enter; return; fi
-    if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
-        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in current directory."; wait_for_enter; return; fi
 
-    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD up -d' in this directory?" "y"; then
+    local compose_dir=$(get_compose_directory)
+    if [[ ! -f "$compose_dir/docker-compose.yml" && ! -f "$compose_dir/docker-compose.yaml" ]]; then
+        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in directory: $compose_dir."; wait_for_enter; return; fi
+
+    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD up -d' in directory '$compose_dir'?" "y"; then
+        pushd "$compose_dir" > /dev/null
         $DOCKER_COMPOSE_CMD up -d
-        print_success "Compose up command executed."
+        popd > /dev/null
+        print_success "Compose up command executed in '$compose_dir'."
     else
         print_warning "Operation cancelled."
     fi
@@ -259,19 +274,23 @@ compose_up() {
 }
 
 compose_down() {
-    print_step "Docker Compose Down (in $(pwd))"
+    print_step "Docker Compose Down"
      if [[ -z "$DOCKER_COMPOSE_CMD" ]]; then print_error "docker-compose / docker compose not found."; wait_for_enter; return; fi
-    if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
-        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in current directory."; wait_for_enter; return; fi
+
+    local compose_dir=$(get_compose_directory)
+    if [[ ! -f "$compose_dir/docker-compose.yml" && ! -f "$compose_dir/docker-compose.yaml" ]]; then
+        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in directory: $compose_dir."; wait_for_enter; return; fi
 
     local remove_volumes_flag=""
     if ask_yes_no "Remove named volumes declared in 'volumes' section? (-v flag)" "n"; then
         remove_volumes_flag="-v"
     fi
 
-    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD down $remove_volumes_flag' in this directory?" "y"; then
+    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD down $remove_volumes_flag' in directory '$compose_dir'?" "y"; then
+        pushd "$compose_dir" > /dev/null
         $DOCKER_COMPOSE_CMD down $remove_volumes_flag
-        print_success "Compose down command executed."
+        popd > /dev/null
+        print_success "Compose down command executed in '$compose_dir'."
     else
         print_warning "Operation cancelled."
     fi
@@ -279,10 +298,12 @@ compose_down() {
 }
 
 compose_logs() {
-    print_step "Docker Compose Logs (in $(pwd))"
+    print_step "Docker Compose Logs"
     if [[ -z "$DOCKER_COMPOSE_CMD" ]]; then print_error "docker-compose / docker compose not found."; wait_for_enter; return; fi
-    if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
-        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in current directory."; wait_for_enter; return; fi
+
+    local compose_dir=$(get_compose_directory)
+    if [[ ! -f "$compose_dir/docker-compose.yml" && ! -f "$compose_dir/docker-compose.yaml" ]]; then
+        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in directory: $compose_dir."; wait_for_enter; return; fi
 
     local follow_logs="n"
     local tail_count=""
@@ -293,30 +314,36 @@ compose_logs() {
     if [[ "$follow_logs" == "y" ]]; then cmd+=" -f"; fi
     if [[ -n "$tail_count" && "$tail_count" =~ ^[0-9]+$ ]]; then cmd+=" --tail $tail_count"; fi
 
-    print_info "Running: $cmd"
+    print_info "Running: $cmd in '$compose_dir'"
+    pushd "$compose_dir" > /dev/null
     if [[ "$follow_logs" == "y" ]]; then
         $DOCKER_COMPOSE_CMD logs -f ${tail_count:+--tail $tail_count}
     else
         $DOCKER_COMPOSE_CMD logs ${tail_count:+--tail $tail_count}
+        popd > /dev/null
         wait_for_enter
     fi
      # If following, Ctrl+C will exit
 }
 
 compose_build() {
-    print_step "Docker Compose Build (in $(pwd))"
+    print_step "Docker Compose Build"
     if [[ -z "$DOCKER_COMPOSE_CMD" ]]; then print_error "docker-compose / docker compose not found."; wait_for_enter; return; fi
-    if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
-        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in current directory."; wait_for_enter; return; fi
+
+    local compose_dir=$(get_compose_directory)
+    if [[ ! -f "$compose_dir/docker-compose.yml" && ! -f "$compose_dir/docker-compose.yaml" ]]; then
+        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in directory: $compose_dir."; wait_for_enter; return; fi
 
     local build_opts=""
     if ask_yes_no "Force build without cache (--no-cache)?" "n"; then build_opts+=" --no-cache"; fi
     if ask_yes_no "Pull newer base images before build (--pull)?" "n"; then build_opts+=" --pull"; fi
 
 
-    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD build $build_opts' in this directory?" "y"; then
+    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD build $build_opts' in directory '$compose_dir'?" "y"; then
+        pushd "$compose_dir" > /dev/null
         $DOCKER_COMPOSE_CMD build $build_opts
-        print_success "Compose build command executed."
+        popd > /dev/null
+        print_success "Compose build command executed in '$compose_dir'."
     else
         print_warning "Operation cancelled."
     fi
@@ -325,20 +352,23 @@ compose_build() {
 
 
 compose_pull() {
-    print_step "Docker Compose Pull (in $(pwd))"
+    print_step "Docker Compose Pull"
     if [[ -z "$DOCKER_COMPOSE_CMD" ]]; then print_error "docker-compose / docker compose not found."; wait_for_enter; return; fi
-    if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
-        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in current directory."; wait_for_enter; return; fi
 
-    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD pull' to pull service images?" "y"; then
+    local compose_dir=$(get_compose_directory)
+    if [[ ! -f "$compose_dir/docker-compose.yml" && ! -f "$compose_dir/docker-compose.yaml" ]]; then
+        print_error "No 'docker-compose.yml' or 'docker-compose.yaml' found in directory: $compose_dir."; wait_for_enter; return; fi
+
+    if ask_yes_no "Run '$DOCKER_COMPOSE_CMD pull' to pull service images in directory '$compose_dir'?" "y"; then
+        pushd "$compose_dir" > /dev/null
         $DOCKER_COMPOSE_CMD pull
-        print_success "Compose pull command executed."
+        popd > /dev/null
+        print_success "Compose pull command executed in '$compose_dir'."
     else
         print_warning "Operation cancelled."
     fi
     wait_for_enter
 }
-
 
 # --- Pruning Functions ---
 prune_resources_menu() {
