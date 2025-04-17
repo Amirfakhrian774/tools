@@ -148,6 +148,38 @@ remove_containers() {
     wait_for_enter
 }
 
+# --- NEW FUNCTION TO CLEAN EVERYTHING EXCEPT IMAGES ---
+cleanup_environment() {
+    print_step "Cleanup Environment (Keep Images)"
+    print_warning "This will stop and remove ALL containers, networks, and unused volumes (except those currently in use by running containers, if any)."
+    if ask_yes_no "Proceed with cleanup? THIS IS DESTRUCTIVE!" "n"; then
+        print_step "Stopping all running containers..."
+        docker stop $(docker ps -q) &> /dev/null
+        print_success "All running containers stopped."
+
+        print_step "Removing all containers..."
+        docker rm -f $(docker ps -aq) &> /dev/null
+        print_success "All containers removed."
+
+        print_step "Removing all unused networks..."
+        docker network prune -f &> /dev/null
+        print_success "All unused networks removed."
+
+        print_step "Removing all unused volumes..."
+        print_warning "Caution: This will remove all volumes not currently in use by any RUNNING container. Ensure this is what you intend."
+        if ask_yes_no "Confirm removal of unused volumes?" "n"; then
+            docker volume prune -f &> /dev/null
+            print_success "All unused volumes removed."
+        else
+            print_warning "Volume removal skipped."
+        fi
+        print_success "Environment cleanup complete (images kept)."
+    else
+        print_warning "Cleanup operation cancelled."
+    fi
+    wait_for_enter
+}
+
 execute_in_container() {
     print_step "Execute Command in Running Container"
     print_info "Running Containers:"
@@ -379,6 +411,7 @@ show_main_menu() {
         "Stop Container(s)" \
         "Start Container(s)" \
         "Restart Container(s)" \
+        "Cleanup Environment (Keep Images)" \
         "Remove Container(s) (Keeps Image)" \
         "Execute Command in Container" \
         "Inspect Docker Object (Container/Image/Volume/Network)" \
@@ -404,6 +437,7 @@ show_main_menu() {
             "Stop Container(s)") stop_containers ;;
             "Start Container(s)") start_containers ;;
             "Restart Container(s)") restart_containers ;;
+            "Cleanup Environment (Keep Images)") cleanup_environment ;;
             "Remove Container(s) (Keeps Image)") remove_containers ;;
             "Execute Command in Container") execute_in_container ;;
             "Inspect Docker Object (Container/Image/Volume/Network)") inspect_object ;;
