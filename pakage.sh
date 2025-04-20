@@ -1,275 +1,202 @@
 #!/bin/bash
 
-# === Script for Downloading and Installing Linux Packages ===
-# Version: 6.1 (Added check for OFFLINE_DIR type)
+# === Script for Preparing and Installing Offline APT Repositories ===
+# Version: 8.4 (Strip quotes from target image input)
 
 # --- Configuration ---
-OFFLINE_DIR="offline_packages" # Directory to store downloaded .deb files
+OFFLINE_REPO_BASE_DIR="offline_repo" # Directory to store prepared offline repositories on this host machine
 
-# Ensure the offline directory exists
-mkdir -p "$OFFLINE_DIR"
-
-# --- Check if OFFLINE_DIR is actually a directory ---
-# This handles the case where a file or broken link with the same name exists
-if [ ! -d "$OFFLINE_DIR" ]; then
-    echo "Error: '$OFFLINE_DIR' exists but is not a directory, or could not be created." >&2
-    echo "Please manually remove the existing file/link named '$OFFLINE_DIR' or check permissions." >&2
-    exit 1 # Exit if it's not a directory
+# Ensure the base directory exists
+mkdir -p "$OFFLINE_REPO_BASE_DIR"
+if [ ! -d "$OFFLINE_REPO_BASE_DIR" ]; then
+    echo "Error: Base directory '$OFFLINE_REPO_BASE_DIR' could not be created or is not a directory." >&2
+    exit 1
 fi
 
-# --- Function Definitions ---
+# --- Check Host Dependencies ---
+host_docker_ok=true
+host_dpkg_dev_ok=true
+if ! command -v docker &> /dev/null; then
+    echo "Warning: 'docker' command not found. Docker is required for preparing offline repositories (Option 1)." >&2
+    host_docker_ok=false
+fi
+if ! command -v dpkg-scanpackages &> /dev/null; then
+    echo "Warning: 'dpkg-scanpackages' command not found. Required for Option 1." >&2
+    echo "         To install it (on Debian/Ubuntu), run this command:" >&2
+    echo "           sudo apt update && sudo apt install dpkg-dev" >&2
+    host_dpkg_dev_ok=false
+fi
 
-# Function to download a package with a spinner into a specified directory
-# (Used for Option 1 and 4)
-download_package() {
-    local pkg_name="$1"
-    local target_dir="$2"
-    local deb_file_name=""
-    local deb_file_path=""
-    local pid
-    local exit_code
-    local spinner='/-\|'
-    local i=0
-
-    echo -n "Downloading package '$pkg_name' locally using apt-get to '$target_dir'...  " >&2
-    local tmp_download_dir=$(mktemp -d)
-    # Check if mktemp succeeded
-    if [[ ! -d "$tmp_download_dir" ]]; then
-        echo "Error: Could not create temporary download directory." >&2
-        return 1
-    fi
-
-    # Run download in background within the temp directory
-    (cd "$tmp_download_dir" && apt-get download "$pkg_name" >/dev/null 2>&1) &
-    pid=$!
-
-    # Show spinner
-    while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) % ${#spinner} ))
-        printf "\b%s" "${spinner:$i:1}" >&2
-        sleep 0.1
-    done
-
-    # Wait for download and get exit code
-    wait $pid
-    exit_code=$?
-    printf "\b \n" >&2 # Clear spinner
-
-    # Check download exit code
-    if [ $exit_code -ne 0 ]; then
-        echo "Error: Failed to download package '$pkg_name'. Check package name, network, and permissions." >&2
-        rm -rf "$tmp_download_dir" # Clean up temp dir
-        return 1
-    fi
-
-    # Find the downloaded file in the temp directory
-    # Using find is safer than ls if filenames have weird characters, but ls is simpler here
-    deb_file_name=$(ls -t "$tmp_download_dir/"*.deb 2>/dev/null | head -n 1 | xargs basename)
-
-    # Check if file was found
-    if [ -z "$deb_file_name" ]; then
-        echo "Error: Download reported success, but .deb file for '$pkg_name' not found in temp dir." >&2
-        rm -rf "$tmp_download_dir"
-        return 1
-    fi
-
-    # Move the file to the target directory
-    mv "$tmp_download_dir/$deb_file_name" "$target_dir/"
-    if [ $? -ne 0 ]; then
-       echo "Error: Failed to move '$deb_file_name' to '$target_dir/' (Is '$target_dir' writable?)." >&2
-       rm -rf "$tmp_download_dir" # Clean up temp dir anyway
-       return 1
-    fi
-
-    # Clean up empty temp dir
-    rm -rf "$tmp_download_dir"
-    deb_file_path="$target_dir/$deb_file_name"
-
-    echo "Download complete: '$deb_file_path'" >&2
-    echo "$deb_file_path" # Return the full path
-    return 0
-}
-
-# Function to install a local .deb file on a remote server via SSH
-# (Used ONLY for Option 3 if offline file found)
-install_deb_ssh() {
-    local local_deb_path="$1"
-    local remote_target="$2"
-    local deb_basename=$(basename "$local_deb_path")
-    local remote_tmp_path="/tmp/$deb_basename"
-
-    echo "Attempting offline install of '$deb_basename' on remote server '$remote_target'..." >&2
-
-    # 1. Copy file
-    echo "Copying '$local_deb_path' to '$remote_target:$remote_tmp_path'..." >&2
-    scp "$local_deb_path" "${remote_target}:$remote_tmp_path"
-    if [ $? -ne 0 ]; then echo "Error: Failed to copy '$deb_basename' to remote server via SSH." >&2; return 1; fi
-    echo "File copied successfully." >&2
-
-    # 2. Install file (using apt to handle dependencies if possible)
-    echo "Installing '$remote_tmp_path' on remote server (using sudo)..." >&2
-    ssh "$remote_target" "sudo apt-get update && sudo apt install -y '$remote_tmp_path'"
-    local install_exit_code=$?
-
-    # 3. Cleanup remote file
-    echo "Cleaning up '$remote_tmp_path' on remote server..." >&2
-    ssh "$remote_target" "rm -f '$remote_tmp_path'"
-
-    if [ $install_exit_code -ne 0 ]; then
-        echo "Error: Failed to install '$deb_basename' from local file on remote server. Dependencies might be missing or file is incompatible." >&2
-        return 1
-    fi
-
-    echo "Package '$deb_basename' installed successfully from local file." >&2
-    return 0
-}
-
-# --- Common Packages List for Bulk Download ---
+# --- Common Packages List for Bulk Prep ---
 COMMON_PACKAGES=(
-    "build-essential" "git" "curl" "wget" "htop" "mc" "vim" "net-tools"
-    "unzip" "python3-pip" "ufw" "tmux" "tree" "jq" "openssh-server"
-    "ca-certificates" "gnupg" "lsb-release" "ncdu" "sysstat" "acl"
-    "rsync" "fail2ban" "logrotate" "sudo"
-) # 25 packages
+    "build-essential" "git" "curl" "wget" "htop" "mc" "vim" "net-tools" "unzip" "python3-pip"
+    "ufw" "tmux" "tree" "jq" "openssh-server" "ca-certificates" "gnupg" "lsb-release" "ncdu"
+    "sysstat" "acl" "rsync" "fail2ban" "logrotate" "sudo" "openjdk-17-jdk-headless" "ca-certificates-java"
+) # ~27 packages
+
+
+# --- Helper Functions ---
+check_container() { local container_id="$1"; if ! docker ps -q -f name="^${container_id}$" -f status=running | grep -q .; then if ! docker ps -q -f id="^${container_id}$" -f status=running | grep -q .; then echo "Error: Container '$container_id' not found or is not running." >&2; return 1; fi; fi; echo "Container '$container_id' found and running." >&2; return 0; }
+sanitize_tag() { echo "$1" | tr -c '[:alnum:]-_.' '_'; }
+download_package() {
+    # This function is kept for potential future use but is not currently called by main options
+    # Its logic was integrated into Option 1's Docker-based download process
+    echo "Error: download_package function is deprecated in this script version." >&2
+    return 1
+}
+install_deb_ssh() {
+    # This function is kept for potential future use but is not currently called by main options
+    # Its logic needs review if re-enabled, as Option 3 now uses full repo install
+     echo "Error: install_deb_ssh function is deprecated in this script version." >&2
+    return 1
+}
 
 
 # --- Main Script Logic ---
-
-# Display Menu
 echo "-------------------------------------------"
-echo " Package Installer Menu (v6.1)"
-echo " Offline Cache Directory: $OFFLINE_DIR/"
+echo " Offline APT Repository Manager (v8.4)"
+echo " Host Repo Base Directory: $OFFLINE_REPO_BASE_DIR/"
 echo "-------------------------------------------"
-echo "1. Download single package .deb file locally"
-echo "2. Install package in Docker Container (Always Online)"
-echo "3. Install package on Remote Server (SSH) (Tries Offline first)"
-echo "4. Bulk download common server packages to offline cache"
+echo "1. Prepare Offline Repository (Needs Internet & Docker on Host)"
+echo "2. Install Offline Repo to Docker Container (Target needs NO Internet)"
+echo "3. Install Offline Repo to Remote Server (SSH) (Target needs NO Internet)"
 echo "-------------------------------------------"
-read -p "Please enter your choice (1-4): " choice
+read -p "Please enter your choice (1-3): " choice
 echo ""
 
-# Handle user choice
 case $choice in
     1)
-        # --- Option 1: Download Single Package ---
-        read -p "Enter the package name to download: " package_name
-        if [ -z "$package_name" ]; then echo "Error: Package name cannot be empty." >&2; exit 1; fi
-
-        echo "Starting Option 1: Download '$package_name' to $OFFLINE_DIR/" >&2
-        deb_filepath=$(download_package "$package_name" "$OFFLINE_DIR")
-        exit_code=$?
-
-        if [ $exit_code -eq 0 ]; then
-            echo "-------------------------------------------" >&2
-            echo "✅ Success: Package downloaded as '$deb_filepath'." >&2
-            echo "-------------------------------------------" >&2
-            exit 0
-        else
-            echo "-------------------------------------------" >&2
-            echo "❌ Operation failed during download." >&2
-            echo "-------------------------------------------" >&2
-            exit 1
+        # --- Option 1: Prepare Offline Repository ---
+        echo "[Option 1 Selected: Prepare Offline Repository]"
+        if ! $host_docker_ok || ! $host_dpkg_dev_ok ; then
+             echo "---------------------------------------------------------------------" >&2; echo "Error: Prerequisites missing for preparing offline repositories." >&2
+             if ! $host_docker_ok; then echo "  - 'docker' command not found. Please install Docker first." >&2; fi
+             if ! $host_dpkg_dev_ok; then echo "  - 'dpkg-scanpackages' command not found." >&2; echo "  - To install it (on Debian/Ubuntu), run this command:" >&2; echo "      sudo apt update && sudo apt install dpkg-dev" >&2; fi
+             echo "---------------------------------------------------------------------" >&2; exit 1
         fi
+
+        # --- Get Target OS Info ---
+        echo ""; echo "IMPORTANT: This step downloads packages and dependencies based on your target OS."; echo "To ensure compatibility, you must first identify the target operating system details."
+        echo ""; echo "  * If Target is an SSH server:"; echo "    Run the following commands ON THE TARGET SERVER:"; echo "      cat /etc/os-release"; echo "      lsb_release -a"
+        echo ""; echo "  * If Target is a Docker container:"; echo "    Run the following command ON THIS HOST machine:"; echo "      docker exec <container_id> cat /etc/os-release"
+        echo ""; echo "Look for values like ID=debian and VERSION_CODENAME=bullseye, or ID=ubuntu and VERSION_ID=\"22.04\"."
+        echo "Based on this information, find the corresponding official Docker Hub image tag"; echo "(e.g., 'debian:bullseye', 'ubuntu:22.04', 'ubuntu:jammy')."
+        echo "---------------------------------------------------------------------"
+        read -p "Enter the Target OS Docker Image tag discovered above: " target_image
+
+        # --- Clean the input ---
+        target_image_cleaned=$(echo "$target_image" | sed "s/^['\"]*//; s/['\"]*$//") # Remove surrounding quotes
+
+        if [ -z "$target_image_cleaned" ]; then echo "Error: Target OS image cannot be empty after cleaning quotes." >&2; exit 1; fi
+        target_os_tag=$(sanitize_tag "$target_image_cleaned") # Use cleaned version for dir name
+
+        # --- Get Package Info ---
+        packages_to_prep=(); repo_name=""
+        read -p "Prepare for [S]ingle package or [G]roup (common server packages)? (S/G): " prep_type
+        if [[ "$prep_type" =~ ^[Ss]$ ]]; then read -p "Enter the single package name: " single_pkg; if [ -z "$single_pkg" ]; then echo "Error: Package name cannot be empty." >&2; exit 1; fi; packages_to_prep=("$single_pkg"); repo_name=$(sanitize_tag "$single_pkg")
+        elif [[ "$prep_type" =~ ^[Gg]$ ]]; then echo "Using common server packages list."; packages_to_prep=("${COMMON_PACKAGES[@]}"); repo_name="common_server_pkgs"
+        else echo "Error: Invalid choice." >&2; exit 1; fi
+
+        repo_path="$OFFLINE_REPO_BASE_DIR/$target_os_tag/$repo_name"; repo_debs_path="$repo_path/debs"
+        echo "Repository will be prepared in: $repo_path"; mkdir -p "$repo_debs_path"; if [ ! -d "$repo_debs_path" ]; then echo "Error: Could not create directory '$repo_debs_path'." >&2; exit 1; fi
+
+        # --- Start Temporary Container ---
+        container_name="offline-prep-$(date +%s)"
+        echo "Starting temporary container '$container_name' from image '$target_image_cleaned'..." # Use cleaned name
+        if ! docker run --rm --name "$container_name" -d "$target_image_cleaned" sleep infinity > /dev/null; then echo "Error: Failed to start temporary container from image '$target_image_cleaned'. Is the image pulled/valid?" >&2; exit 1; fi # Use cleaned name in error
+        trap "echo 'Stopping temporary container $container_name...'; docker stop $container_name > /dev/null || true" EXIT
+
+        echo "Container started. Updating APT lists inside container..."; if ! docker exec "$container_name" bash -c "apt-get update -qq"; then echo "Error: Failed to run apt-get update inside container." >&2; exit 1; fi; echo "APT lists updated."
+
+        # --- Download Packages and Dependencies ---
+        echo "Attempting to download packages (and dependencies): ${packages_to_prep[*]}"; failed_pkg_download=false
+        for pkg in "${packages_to_prep[@]}"; do echo "  Downloading: $pkg ..."; if ! docker exec "$container_name" bash -c "apt-get install --download-only -y $pkg" >&2 ; then echo "Warning: Failed to process/download package '$pkg' or its dependencies." >&2; failed_pkg_download=true; fi; done
+        echo "Package download process completed."
+
+        # --- Copy DEBs Out ---
+        echo "Copying downloaded .deb files from container to host's '$repo_debs_path'..."; copied_files=false
+        if ! docker cp "${container_name}:/var/cache/apt/archives/." "$repo_debs_path/"; then
+            if docker exec "$container_name" bash -c '[ -z "$(ls -A /var/cache/apt/archives)" ]'; then echo "Warning: No .deb files found in container's apt cache." >&2; else echo "Error: Failed to copy .deb files from container." >&2; exit 1; fi
+        else if [ -n "$(ls -A "$repo_debs_path/" 2>/dev/null)" ]; then echo ".deb files copied."; copied_files=true; else echo "Warning: No .deb files seem to have been copied." >&2; fi; fi
+
+        # --- Generate Packages.gz ---
+        echo "Generating APT repository metadata (Packages.gz)..."
+        if $copied_files && [ -n "$(ls -A "$repo_debs_path/"*.deb 2>/dev/null)" ]; then
+             (cd "$repo_debs_path" && dpkg-scanpackages . /dev/null | gzip -c > Packages.gz)
+             if [ $? -ne 0 ]; then echo "Error: dpkg-scanpackages failed." >&2; exit 1; fi; echo "Repository metadata created successfully."
+        else echo "Skipping metadata generation as no .deb files were found/copied."; if ! $failed_pkg_download && ! $copied_files; then echo "Warning: Investigate needed." >&2; fi; fi
+
+        trap - EXIT; echo "Stopping temporary container $container_name..."; docker stop "$container_name" > /dev/null
+
+        # --- Report ---
+        echo "-------------------------------------------" >&2
+        if $failed_pkg_download; then echo "⚠️ Preparation completed with warnings/failures during download." >&2; else echo "✅ Preparation Complete!" >&2; fi
+        echo "   Offline repository prepared at: $repo_path"; echo "   Transfer this directory to the target and use Option 2 or 3." >&2
+        echo "-------------------------------------------" >&2
+        if $failed_pkg_download; then exit 1; else exit 0; fi
         ;;
 
     2)
-        # --- Option 2: Install in Docker Container (ALWAYS ONLINE) ---
-        read -p "Enter the package name to install: " package_name
-        read -p "Enter the Docker container name or ID: " container_id
-        if [ -z "$package_name" ] || [ -z "$container_id" ]; then echo "Error: Package name and container ID cannot be empty." >&2; exit 1; fi
+        # --- Option 2: Install Offline Repo to Docker Container ---
+        echo "[Option 2 Selected: Install Offline Repo to Docker Container]"
+        read -p "Enter path to the prepared host repository directory: " host_repo_path; read -p "Enter the target Docker container name or ID: " container_id; read -p "Enter the main package(s) to install (space-separated): " packages_to_install
+        if [ ! -d "$host_repo_path/debs" ]; then echo "Error: Repo '$host_repo_path/debs' not found." >&2; exit 1; fi; if [ -z "$container_id" ]; then echo "Error: Container ID cannot be empty." >&2; exit 1; fi; if [ -z "$packages_to_install" ]; then echo "Error: Package(s) to install cannot be empty." >&2; exit 1; fi
+        check_container "$container_id" || exit 2
 
-        echo "Starting Option 2: Install '$package_name' in Docker Container '$container_id' (Online Mode Only)" >&2
+        container_repo_path="/tmp/offline-repo-$(date +%s)"; container_sources_dir="/etc/apt/sources.list.d"; container_offline_list="$container_sources_dir/offline.list"; host_backup_dir="$OFFLINE_REPO_BASE_DIR/.${container_id}.sources.bak"; container_main_sources_file="/etc/apt/sources.list"; echo "Starting Offline Installation for '$container_id'..."
 
-        # Check container status
-        if ! docker ps -q -f name="^${container_id}$" -f status=running | grep -q .; then
-            if ! docker ps -q -f id="^${container_id}$" -f status=running | grep -q .; then echo "Error: Container '$container_id' not found or is not running." >&2; exit 2; fi
-        fi
-        echo "Container '$container_id' found and running." >&2
+        echo "Backing up container's APT sources to host:'$host_backup_dir'..."; rm -rf "$host_backup_dir"; mkdir -p "$host_backup_dir/sources.list.d"
+        docker cp "${container_id}:$container_main_sources_file" "$host_backup_dir/sources.list" >/dev/null 2>&1 || echo "Warning: Failed to backup $container_main_sources_file" >&2
+        docker cp "${container_id}:$container_sources_dir/." "$host_backup_dir/sources.list.d/" >/dev/null 2>&1 || echo "Warning: Failed to backup $container_sources_dir contents" >&2
 
-        # Install directly inside the container using its apt-get (always online)
-        echo "Attempting to update apt and install '$package_name' inside container '$container_id' (as root)..." >&2
-        docker exec -u root "$container_id" bash -c "apt-get update && apt-get install -y $package_name"
-        install_exit_code=$?
+        echo "Transferring repository '$host_repo_path' to container path '$container_repo_path'..."
+        if ! docker cp "$host_repo_path/." "$container_id:$container_repo_path/"; then echo "Error: Failed to copy repository to container." >&2; exit 1; fi
 
-        # Report final status
-        echo "-------------------------------------------" >&2
-        if [ $install_exit_code -eq 0 ]; then
-            echo "✅ Operation completed. '$package_name' should now be installed in '$container_id'." >&2
-            exit 0
-        else
-            echo "❌ Operation failed to install '$package_name' in '$container_id'. Check errors above." >&2
-            exit 1
-        fi
+        echo "Configuring APT sources in container for offline repo..."; repo_line="deb [trusted=yes] file:${container_repo_path}/debs ./"
+        mod_sources_cmd="mkdir -p '$container_sources_dir' && rm -f $container_sources_dir/* && sed -i.bak 's/^\\s*deb/#deb/' $container_main_sources_file && echo '$repo_line' > '$container_offline_list'"
+        if ! docker exec -u root "$container_id" bash -c "$mod_sources_cmd"; then echo "Error: Failed to modify APT sources inside container." >&2; echo "Attempting to restore original sources..." >&2; docker cp "$host_backup_dir/sources.list" "${container_id}:$container_main_sources_file" >/dev/null 2>&1; docker cp "$host_backup_dir/sources.list.d/." "${container_id}:$container_sources_dir/" >/dev/null 2>&1; docker exec -u root "$container_id" rm -rf "$container_repo_path"; exit 1; fi
+
+        echo "Running apt update and installing '$packages_to_install' from offline repo..."
+        install_cmd="apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true && apt-get install -y --allow-unauthenticated $packages_to_install"; install_success=false
+        if docker exec -u root "$container_id" bash -c "$install_cmd"; then install_success=true; else echo "Error: apt-get install failed inside container." >&2; fi
+
+        echo "Restoring original APT sources in container..."; docker cp "$host_backup_dir/sources.list" "${container_id}:$container_main_sources_file" >/dev/null 2>&1; docker cp "$host_backup_dir/sources.list.d/." "${container_id}:$container_sources_dir/" >/dev/null 2>&1; if [ $? -ne 0 ]; then echo "Warning: Failed to restore original sources." >&2; fi
+        echo "Removing temporary offline repository from container..."; docker exec -u root "$container_id" rm -rf "$container_repo_path"
+
+        echo "-------------------------------------------" >&2; if $install_success; then echo "✅ Offline installation completed successfully." >&2; exit 0; else echo "❌ Offline installation failed." >&2; exit 1; fi
         ;;
 
     3)
-        # --- Option 3: Install on Remote Server (SSH) (Tries Offline First) ---
-        read -p "Enter the package name to install: " package_name
-        read -p "Enter the remote target (e.g., user@hostname or user@IP): " remote_target
-        if [ -z "$package_name" ] || [ -z "$remote_target" ]; then echo "Error: Package name and remote target cannot be empty." >&2; exit 1; fi
+        # --- Option 3: Install Offline Repo to Remote Server (SSH) ---
+        echo "[Option 3 Selected: Install Offline Repo to Remote Server (SSH)]"
+        read -p "Enter path to the prepared host repository directory: " host_repo_path; read -p "Enter the remote target (user@hostname): " remote_target; read -p "Enter the main package(s) to install (space-separated): " packages_to_install
+        if [ ! -d "$host_repo_path/debs" ]; then echo "Error: Repo '$host_repo_path/debs' not found." >&2; exit 1; fi; if [ -z "$remote_target" ]; then echo "Error: Remote target cannot be empty." >&2; exit 1; fi; if [ -z "$packages_to_install" ]; then echo "Error: Package(s) to install cannot be empty." >&2; exit 1; fi
 
-        echo "Starting Option 3: Install '$package_name' on Remote Server '$remote_target'" >&2
+        remote_repo_path="/tmp/offline-repo-$(date +%s)"; remote_sources_dir="/etc/apt/sources.list.d"; remote_offline_list="$remote_sources_dir/offline.list"; remote_main_sources_file="/etc/apt/sources.list"; remote_backup_dir="/tmp/sources.bak.$(date +%s)"; echo "Starting Offline Installation on '$remote_target'..."
 
-        # Check for local offline package
-        local_deb_path=$(ls -t "${OFFLINE_DIR}/${package_name}"_*.deb 2>/dev/null | head -n 1)
+        echo "Backing up remote APT sources to '$remote_backup_dir' on target..."; backup_cmd="sudo mkdir -p '$remote_backup_dir/sources.list.d' && sudo cp -a '$remote_main_sources_file' '$remote_backup_dir/sources.list' && sudo cp -a '$remote_sources_dir/.' '$remote_backup_dir/sources.list.d/' || echo 'Backup Warning'"
+        if ! ssh "$remote_target" "$backup_cmd"; then echo "Warning: Failed to backup remote sources." >&2; fi
 
-        install_success=false
-        # If a local .deb file exists, try the offline installation function
-        if [[ -n "$local_deb_path" && -f "$local_deb_path" ]]; then
-            echo "Found local package: $local_deb_path. Attempting offline installation..." >&2
-            install_deb_ssh "$local_deb_path" "$remote_target"
-            if [ $? -eq 0 ]; then install_success=true; fi
-        else
-        # Otherwise, proceed with standard online installation
-            echo "No local package found for '$package_name' in '$OFFLINE_DIR/'. Attempting online installation..." >&2
-            ssh "$remote_target" "sudo apt-get update && sudo apt-get install -y $package_name"
-            if [ $? -eq 0 ]; then install_success=true; fi
-        fi
+        echo "Transferring repository '$host_repo_path' to remote path '$remote_repo_path'..."
+        if ! scp -r "$host_repo_path/." "${remote_target}:$remote_repo_path/"; then echo "Error: Failed to copy repository via scp." >&2; exit 1; fi
 
-        # Report final status
-        echo "-------------------------------------------" >&2
-        if $install_success; then
-            echo "✅ Operation completed. '$package_name' should now be installed on '$remote_target'." >&2
-            exit 0
-        else
-            echo "❌ Operation failed to install '$package_name' on '$remote_target'. Check errors above." >&2
-            exit 1
-        fi
-        ;;
+        echo "Configuring APT sources on remote server for offline repo..."; repo_line="deb [trusted=yes] file:${remote_repo_path}/debs ./"
+        mod_sources_cmd="sudo mkdir -p '$remote_sources_dir'; sudo rm -f ${remote_sources_dir}/* && sudo sed -i.orig.\$(date +%s) 's/^\\s*deb\\b/#deb/' '$remote_main_sources_file' && echo '$repo_line' | sudo tee '$remote_offline_list' > /dev/null"
+        if ! ssh "$remote_target" "$mod_sources_cmd"; then echo "Error: Failed to modify APT sources on remote server." >&2; echo "Attempting cleanup of remote repo..." >&2; ssh "$remote_target" "sudo rm -rf '$remote_repo_path'"; echo "Check remote APT sources manually." >&2; exit 1; fi
 
-    4)
-        # --- Option 4: Bulk Download Common Packages ---
-        echo "Starting Option 4: Bulk download common packages to '$OFFLINE_DIR/'" >&2
-        successful_downloads=0
-        failed_downloads=0
-        total_packages=${#COMMON_PACKAGES[@]}
+        echo "Running apt update and installing '$packages_to_install' from offline repo on remote..."
+        install_cmd="sudo apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true && sudo apt-get install -y --allow-unauthenticated $packages_to_install"; install_success=false
+        if ssh "$remote_target" "$install_cmd"; then install_success=true; else echo "Error: apt-get install failed on remote server." >&2; fi
 
-        echo "Packages to download: ${COMMON_PACKAGES[*]}" >&2
+        echo "Restoring original APT sources on remote server..."; restore_cmd="[ -f '${remote_main_sources_file}.orig.'* ] && sudo mv '${remote_main_sources_file}.orig.'* '$remote_main_sources_file' 2>/dev/null || sudo cp -a '$remote_backup_dir/sources.list' '$remote_main_sources_file'; sudo rm -f ${remote_sources_dir}/*; sudo cp -a '${remote_backup_dir}/sources.list.d/.' '$remote_sources_dir/'; sudo rm -rf '$remote_backup_dir'"
+        if ! ssh "$remote_target" "$restore_cmd"; then echo "Warning: Failed to automatically restore original sources on remote." >&2; fi
+        echo "Removing temporary offline repository from remote server..."; ssh "$remote_target" "sudo rm -rf '$remote_repo_path'"
 
-        for pkg in "${COMMON_PACKAGES[@]}"; do
-            echo "--- Downloading $pkg ---" >&2
-            # Call download_package but discard stdout path, just check exit code ($?)
-            download_package "$pkg" "$OFFLINE_DIR" > /dev/null
-            if [ $? -eq 0 ]; then
-                ((successful_downloads++))
-            else
-                ((failed_downloads++))
-                echo "Warning: Failed to download '$pkg'." >&2
-            fi
-        done
-
-        echo "-------------------------------------------" >&2
-        echo "Bulk Download Summary:" >&2
-        echo "  Total Packages Attempted: $total_packages" >&2
-        echo "  Successful Downloads: $successful_downloads" >&2
-        echo "  Failed Downloads: $failed_downloads" >&2
-        echo "  Downloaded packages are located in: $OFFLINE_DIR/" >&2
-        echo "-------------------------------------------" >&2
-        if [ $failed_downloads -gt 0 ]; then exit 1; else exit 0; fi # Exit with error if any download failed
+        echo "-------------------------------------------" >&2; if $install_success; then echo "✅ Offline installation completed successfully." >&2; exit 0; else echo "❌ Offline installation failed." >&2; exit 1; fi
         ;;
 
     *)
-        echo "Invalid choice. Please enter a number between 1 and 4." >&2
+        echo "Invalid choice. Please enter a number between 1 and 3." >&2
         exit 1
         ;;
 esac
